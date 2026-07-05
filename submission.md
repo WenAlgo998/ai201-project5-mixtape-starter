@@ -130,3 +130,97 @@ from the shared `ListeningEvent` log.
   yesterday. This tells me the fixtures are designed to expose edge cases.
 
 ---
+
+## Bug Selection & Reproduction (Milestone 2)
+
+I chose to reproduce **Issue #1 (streak)**, **Issue #5 (playlist)**, and **Issue #3
+(search duplicates)** first, then pivoted from #3 to **Issue #4 (notifications)** for
+the reason documented below. All reproduction was done read-only against the seeded
+database — no application code was changed in this milestone.
+
+### Note: why I pivoted away from Issue #3
+
+Issue #3 reports that "the same song keeps showing up twice in search." I tried to
+reproduce it before fixing. I ran `search_songs()` for six queries, including `q='e'`
+which matches all five songs that carry 3 tags each (Crown Heights Anthem, Harlem
+Renaissance, After Hours, Lagos to London, Frequencies). If the `outerjoin(song_tags)`
+in `search_service` leaked its row multiplication, a 3-tag song would appear 3 times.
+
+Observed: **every query returned each song exactly once** (`has_duplicate_ids=False`
+for all six queries). The reason is that `search_service` uses the legacy
+`db.session.query(Song)` interface, and legacy SQLAlchemy `Query.all()` de-duplicates
+full-entity result rows by primary-key identity. The join still fans out to 3 rows for
+a 3-tag song, but `.all()` collapses them back to one `Song` instance before the
+service maps them to dicts. In this codebase version the reported duplicate does not
+manifest, so I could not honestly reproduce it. Following the milestone's guidance
+("if you can't reproduce a bug after a genuine attempt, try a different one"), I
+substituted **Issue #4**, which reproduces deterministically.
+
+---
+
+## Root Cause Analyses
+
+Each entry below is tied to a specific issue number and will be completed across the
+remaining milestones with all five required fields: reproduction, navigation strategy,
+root cause, fix, and side-effect check.
+
+### Issue #1 — My listening streak keeps resetting
+
+**1. How I reproduced it.**
+The bug report is vague about *when* the reset happens, so I isolated the condition by
+driving `update_listening_streak(user, now)` directly with controlled dates (a
+read-only harness, no DB writes). I used three consecutive real calendar days in 2026:
+Friday 6/26, Saturday 6/27, Sunday 6/28, Monday 6/29.
+
+- **Sat → Sun** (streak 5, last listened Saturday, listens Sunday): a genuine
+  consecutive day. Observed streak → **1** (should be 6). **Bug reproduced.**
+- **Fri → Sat** (streak 5, listens Saturday): also consecutive. Observed streak → **6**.
+  Correct — so the reset is *not* happening on every consecutive day.
+- **Sat → Mon** (streak 5, listens Monday): a real one-day gap. Observed streak → **1**.
+  Correct — this reset is legitimate.
+
+The pattern is unmistakable: the streak resets **only when the new listen lands on a
+Sunday**, even though the previous day (Saturday) was consecutive. That matches user
+reports of a streak "keeps resetting" without an obvious cause — it silently breaks
+once a week.
+
+### Issue #5 — The last song in a playlist never shows up
+
+**1. How I reproduced it.**
+I compared the number of `playlist_entries` rows in the database against the number of
+songs returned by `get_playlist_songs()` for all three seeded playlists, and checked
+whether the highest-`position` song was in the output.
+
+| Playlist | Entries in DB | Returned by service | Highest-position song present? |
+|----------|--------------|---------------------|-------------------------------|
+| Late Night Vibes | 7 | 6 | No — "Free Throws" (pos 7) missing |
+| Friday Energy | 7 | 6 | No — "Harlem Renaissance" (pos 7) missing |
+| Study Mode | 7 | 6 | No — "Lagos to London" (pos 7) missing |
+
+Every playlist returns exactly one fewer song than it contains, and in each case it is
+specifically the song with the largest `position` value (the last one in playlist
+order) that disappears. Consistent and deterministic. **Bug reproduced.**
+
+### Issue #4 — Notified when a friend adds my song to a playlist, but not when they rate it
+
+**1. How I reproduced it.**
+I picked a song shared by `simone` and had a different user (`nova`) rate it 5, then
+counted notifications addressed to the sharer before and after.
+
+- Before rating: sharer had **0** notifications of type `song_rated`.
+- After `rate_song(nova, song, 5)`: sharer still had **0**. **Bug reproduced — no
+  notification is created.**
+
+For contrast, the seed data contains a working `song_added_to_playlist` notification,
+and the code path that produces it (`add_to_playlist`) explicitly calls
+`create_notification()`. So the platform clearly *can* notify a sharer about an
+interaction — the rating path simply never does. This confirms the report: the
+playlist-add notification works, the rating notification is silently absent.
+
+*(Incidental finding while building the comparison harness: calling `add_to_playlist()`
+live raises `NOT NULL constraint failed: playlist_entries.position`, because appending
+through the `playlist.songs` relationship doesn't populate the `position`/`added_by`
+columns the join table requires. This is a real latent bug but is not one of the five
+listed issues, so it is out of scope here — noted for completeness.)*
+
+---
