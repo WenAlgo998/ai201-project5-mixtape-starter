@@ -5,6 +5,49 @@
 
 ---
 
+## AI Usage
+
+I used an AI assistant as a navigation and explanation aid during this project, not as
+a bug oracle. My workflow was consistent for every bug: **I located the suspicious code
+myself first, then used AI to explain or confirm what it did, then verified the answer
+against the code (or by running it) before acting.** This matches the project's own
+advice that AI is reliable for explaining code you've already found but unreliable for
+guessing the bug before you've read it. Below are the specific, honest instances —
+including where the AI helped and where it was wrong.
+
+**Navigation & explanation (where AI helped):**
+
+1. **Confirming `datetime.weekday()`'s convention (Issue #1).** After I spotted the
+   `today.weekday() != 6` clause, I asked the AI what `datetime.weekday()` returns and
+   how it differs from `isoweekday()`. It explained that `weekday()` is 0-indexed from
+   Monday (so Sunday = 6) while `isoweekday()` is 1-indexed (Sunday = 7). I verified this
+   independently by printing `.weekday()` for known Saturday/Sunday/Monday dates in my
+   reproduction harness (Sat=5, Sun=6, Mon=0) before concluding that `!= 6` was the
+   Sunday special case. The AI explained; the harness proved it.
+
+2. **Comparing the two notification paths (Issue #4).** I gave the AI the `rate_song()`
+   and `add_to_playlist()` functions and asked what the structural difference between
+   them was. It pointed out that `add_to_playlist()` ends with a guarded
+   `create_notification()` call and `rate_song()` has no notification step at all. I
+   confirmed this by reading both functions myself and then by running a before/after
+   notification count, rather than trusting the explanation on its own.
+
+**Verification & course-correction (where I had to check AI's work):**
+
+3. **A place AI was incomplete and I had to course-correct (Issue #3).** Before reading
+   the code closely, I asked the AI whether the `outerjoin(song_tags)` in
+   `search_service` would cause duplicate rows for multi-tag songs. It answered "yes,
+   an outer join fans out one row per tag, so a 3-tag song appears 3 times" — which is
+   true of the SQL but wrong about the observable result here. When I actually ran
+   `search_songs()` I got no duplicates. I had to correct the AI's answer myself: the
+   service uses the legacy `db.session.query(Song)` interface, and legacy SQLAlchemy
+   `Query.all()` de-duplicates full-entity rows by identity, so the fan-out is collapsed
+   before the dicts are built. This is why I could not reproduce Issue #3 and pivoted to
+   Issue #4. The AI's plausible-but-wrong answer is exactly the failure mode the project
+   warns about, and running the code is what caught it.
+
+---
+
 ## Milestone 1 — Codebase Map
 
 *Written before opening any issue file, as an orientation exercise. This section
@@ -218,13 +261,14 @@ is already the complete and correct test. The `weekday()` clause introduced a sp
 weekly boundary where none should exist, so any user with an active streak lost it the
 first time they listened on a Sunday.
 
-**4. My fix and side-effect check.**
+**4. My fix.**
 I removed the `and today.weekday() != 6` clause so the branch reads
 `elif days_since_last == 1:`. This restores the intended rule — "one calendar day
 since last listen ⇒ increment" — with no dependence on the weekday. It is the smallest
 change that addresses the root cause; I touched nothing else.
 
-Side-effect check: streak logic is a boundary problem, so I verified *both* sides of
+**5. Side-effect check.**
+Streak logic is a boundary problem, so I verified *both* sides of
 every boundary rather than only the failing case. Using controlled dates I confirmed:
 Sat→Sun now increments (6, the previously-broken case); Fri→Sat still increments (6, a
 non-Sunday consecutive day, to prove I didn't just special-case Sunday); Sat→Mon still
@@ -281,12 +325,13 @@ systematically omits the last song of every non-empty playlist. There is no cond
 under which dropping that element is correct; it is a plain off-by-one truncation that
 disagrees with the documented contract of the function.
 
-**4. My fix and side-effect check.**
+**4. My fix.**
 I changed `songs[:-1]` to `songs`, so the comprehension iterates the complete ordered
 result. This is the minimal fix — the query was already correct, so only the erroneous
 truncation needed to go.
 
-Side-effect check (again a boundary bug, so I checked both ends): all three seeded
+**5. Side-effect check.**
+Again a boundary bug, so I checked both ends: all three seeded
 playlists now return their full count (7 = 7) with order preserved. I specifically
 checked the small-input boundaries that a slice like `[:-1]` is most likely to break:
 an **empty** playlist still returns `[]` (before the fix `[][:-1]` was also `[]`, so
@@ -351,7 +396,7 @@ no one (that code path has no such call). This is a missing-step defect, which i
 no amount of staring at the rating math would reveal it; the rating logic is correct,
 it's just incomplete.
 
-**4. My fix and side-effect check.**
+**4. My fix.**
 I added a notification step to `rate_song()`, deliberately mirroring the exact shape of
 the proven `add_to_playlist()` block so the two interaction paths stay structurally
 consistent. After the commit, if `song.shared_by != user_id`, it calls
@@ -360,7 +405,8 @@ rater, the song, and the score. I placed it after `db.session.commit()` so a fai
 rating write can't produce a phantom notification, and I reused the existing
 `create_notification()` helper rather than writing new persistence logic.
 
-Side-effect check — I verified specific behaviors that this change could plausibly
+**5. Side-effect check.**
+I verified specific behaviors that this change could plausibly
 affect, not just that the app still ran:
 - **Self-rating must not notify.** The `song.shared_by != user_id` guard mirrors
   `add_to_playlist`'s guard; I confirmed that when the sharer rates their own song, the
@@ -376,38 +422,3 @@ affect, not just that the app still ran:
   changed rating is a fresh interaction worth surfacing — and it matches
   `add_to_playlist`, which notifies on each call rather than only the first.
 - Full test suite: 13 passed, 0 failed.
-
----
-
-## AI Usage
-
-I used an AI assistant as a navigation and explanation aid, not as a bug oracle. In
-every case I located the suspicious code myself first, then used AI to confirm or
-explain, then verified the answer against the code before acting.
-
-1. **Confirming `datetime.weekday()`'s convention (Issue #1).** After I spotted the
-   `today.weekday() != 6` clause, I asked the AI what `datetime.weekday()` returns and
-   how it differs from `isoweekday()`. It explained that `weekday()` is 0-indexed from
-   Monday (so Sunday = 6) while `isoweekday()` is 1-indexed (Sunday = 7). I verified this
-   independently by printing `.weekday()` for known Saturday/Sunday/Monday dates in my
-   reproduction harness (Sat=5, Sun=6, Mon=0) before concluding that `!= 6` was the
-   Sunday special case. The AI explained; the harness proved it.
-
-2. **Comparing the two notification paths (Issue #4).** I gave the AI the `rate_song()`
-   and `add_to_playlist()` functions and asked what the structural difference between
-   them was. It pointed out that `add_to_playlist()` ends with a guarded
-   `create_notification()` call and `rate_song()` has no notification step at all. I
-   confirmed this by reading both functions myself and then by running a before/after
-   notification count, rather than trusting the explanation on its own.
-
-3. **A place AI was incomplete and I had to course-correct (Issue #3).** Before reading
-   the code closely, I asked the AI whether the `outerjoin(song_tags)` in
-   `search_service` would cause duplicate rows for multi-tag songs. It answered "yes,
-   an outer join fans out one row per tag, so a 3-tag song appears 3 times" — which is
-   true of the SQL but wrong about the observable result here. When I actually ran
-   `search_songs()` I got no duplicates. I had to correct the AI's answer myself: the
-   service uses the legacy `db.session.query(Song)` interface, and legacy SQLAlchemy
-   `Query.all()` de-duplicates full-entity rows by identity, so the fan-out is collapsed
-   before the dicts are built. This is why I could not reproduce Issue #3 and pivoted to
-   Issue #4. The AI's plausible-but-wrong answer is exactly the failure mode the project
-   warns about, and running the code is what caught it.
