@@ -42,9 +42,11 @@ including where the AI helped and where it was wrong.
    `search_songs()` I got no duplicates. I had to correct the AI's answer myself: the
    service uses the legacy `db.session.query(Song)` interface, and legacy SQLAlchemy
    `Query.all()` de-duplicates full-entity rows by identity, so the fan-out is collapsed
-   before the dicts are built. This is why I could not reproduce Issue #3 and pivoted to
-   Issue #4. The AI's plausible-but-wrong answer is exactly the failure mode the project
-   warns about, and running the code is what caught it.
+   before the dicts are built. This is why the user-visible symptom did not reproduce;
+   I initially deferred #3 to fix bugs I could reproduce, then returned to it for the
+   "fix all 5" stretch, confirming the latent row multiplication at the SQL level and
+   fixing the root condition. The AI's plausible-but-wrong answer is exactly the failure
+   mode the project warns about, and running the code is what caught it.
 
 ---
 
@@ -176,36 +178,44 @@ from the shared `ListeningEvent` log.
 
 ## Bug Selection & Reproduction (Milestone 2)
 
-I chose to reproduce **Issue #1 (streak)**, **Issue #5 (playlist)**, and **Issue #3
-(search duplicates)** first, then pivoted from #3 to **Issue #4 (notifications)** for
-the reason documented below. All reproduction was done read-only against the seeded
-database — no application code was changed in this milestone.
+I addressed all five issues. My three **required** fixes were **Issue #1 (streak)**,
+**Issue #5 (playlist)**, and **Issue #4 (notifications)**. I then completed the two
+stretch bugs: **Issue #2 (feed)** as the 4th fix, and **Issue #3 (search duplicates)**
+as the 5th. All reproduction was done read-only against the seeded database before any
+code was changed.
 
-### Note: why I pivoted away from Issue #3
+Issue #3 required special handling, documented below, because its user-visible symptom
+does not surface in this codebase version even though the underlying defect is real.
+
+### Note on Issue #3: a real defect with a currently-masked symptom
 
 Issue #3 reports that "the same song keeps showing up twice in search." I tried to
-reproduce it before fixing. I ran `search_songs()` for six queries, including `q='e'`
-which matches all five songs that carry 3 tags each (Crown Heights Anthem, Harlem
-Renaissance, After Hours, Lagos to London, Frequencies). If the `outerjoin(song_tags)`
-in `search_service` leaked its row multiplication, a 3-tag song would appear 3 times.
+reproduce the *user-visible* symptom first. I ran `search_songs()` for six queries,
+including `q='e'` which matches all five songs that carry 3 tags each (Crown Heights
+Anthem, Harlem Renaissance, After Hours, Lagos to London, Frequencies). If the
+`outerjoin(song_tags)` in `search_service` leaked its row multiplication, a 3-tag song
+would appear 3 times.
 
-Observed: **every query returned each song exactly once** (`has_duplicate_ids=False`
-for all six queries). The reason is that `search_service` uses the legacy
-`db.session.query(Song)` interface, and legacy SQLAlchemy `Query.all()` de-duplicates
-full-entity result rows by primary-key identity. The join still fans out to 3 rows for
-a 3-tag song, but `.all()` collapses them back to one `Song` instance before the
-service maps them to dicts. In this codebase version the reported duplicate does not
-manifest, so I could not honestly reproduce it. Following the milestone's guidance
-("if you can't reproduce a bug after a genuine attempt, try a different one"), I
-substituted **Issue #4**, which reproduces deterministically.
+Observed at the ORM level: **every query returned each song exactly once**
+(`has_duplicate_ids=False` for all six queries). The reason is that `search_service`
+uses the legacy `db.session.query(Song)` interface, and legacy SQLAlchemy `Query.all()`
+de-duplicates full-entity result rows by primary-key identity. So the symptom is
+currently *masked* — but the defect is genuinely present. I confirmed this by issuing
+the exact same join and filter while selecting a **column** instead of the entity
+(which bypasses the ORM's identity de-dup): for `q='heights'` the query returned **3
+identical rows** for the single 3-tag song, and removing the join returned **1**. The
+duplicate rows are real; the app only avoids showing them by accident. Because the
+stretch goal is to fix all five issues, I treated this as a latent bug and fixed the
+root condition rather than relying on the fragile masking (full RCA below).
 
 ---
 
 ## Root Cause Analyses
 
-Each entry below is tied to a specific issue number and will be completed across the
-remaining milestones with all five required fields: reproduction, navigation strategy,
-root cause, fix, and side-effect check.
+Each entry is tied to a specific issue number and covers all five required fields:
+reproduction steps, navigation strategy, root cause explanation, fix description, and
+side-effect check. The three required bugs (#1, #5, #4) come first, followed by the two
+stretch bugs (#2, #3).
 
 ### Issue #1 — My listening streak keeps resetting
 
@@ -422,3 +432,139 @@ affect, not just that the app still ran:
   changed rating is a fresh interaction worth surfacing — and it matches
   `add_to_playlist`, which notifies on each call rather than only the first.
 - Full test suite: 13 passed, 0 failed.
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**1. How I reproduced it.**
+"Friends Listening Now" is supposed to show who is *currently* listening. I called
+`get_friends_listening_now()` for every seeded user and, for each friend returned,
+computed how long ago their shown listening event actually happened. Three users'
+feeds surfaced a friend whose event was **2 hours old**: darius, simone, and kenji all
+showed `nova` as "listening now" even though nova last listened 2 hours earlier. With a
+30-minute window that friend correctly disappears. The seed data documents the intended
+contract in a comment — recent events "within the past 30 minutes … should appear," and
+older events "should NOT appear in 'listening now' after fix" — which matched exactly
+what I saw was broken. **Bug reproduced.**
+
+(One subtlety I had to account for: the function de-duplicates to each friend's *most
+recent* event, so friends who also have a fresh event mask their own stale ones. The
+bug only surfaces for a friend whose newest event is old-but-within-24h — which is why
+it shows up in darius/simone/kenji's feeds but not nova's.)
+
+**2. How I found the root cause.**
+Route-first again: `GET /feed/<user_id>/listening-now` in `routes/feed.py` calls
+`get_friends_listening_now()` in `feed_service.py`. Reading the function, the recency
+filter is `ListeningEvent.listened_at >= cutoff`, where `cutoff = datetime.now(utc) -
+RECENT_THRESHOLD`. That pushed me one line up to the module constant:
+`RECENT_THRESHOLD = timedelta(hours=24)`. The query, the cutoff arithmetic, and the
+ordering were all correct — the only thing wrong was the *size* of the window. A
+24-hour window means "listened at any point in the last day," which by definition
+includes people from yesterday. That mismatch between the feature's name ("now") and
+the constant's value (24h) was the moment I was sure the constant was the defect.
+
+**3. The root cause.**
+The single constant `RECENT_THRESHOLD` was set to `timedelta(hours=24)`. Because the
+feed includes every friend with a listening event newer than `now - RECENT_THRESHOLD`,
+a 24-hour window admits anyone who listened at any time in the previous day — i.e.,
+"people from yesterday." A "listening now" feature must use a short recency window;
+the correct behavior requires the threshold to be on the order of minutes, not a full
+day. Nothing else in the function was wrong.
+
+**4. My fix.**
+I changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`,
+matching the intended contract spelled out in `seed_data.py` ("within the past 30
+minutes"). This is a one-line, targeted change to the constant; the query logic is
+untouched.
+
+**5. Side-effect check.**
+This is a boundary bug, so I checked both sides of the 30-minute boundary. Just inside:
+the genuinely-recent seeded events (10–20 minutes ago) still appear in every affected
+feed. Just outside: the 2-hour-old event that caused the bug is now excluded from all
+three feeds that previously showed it. I also checked the *other* consumer of the same
+data, `get_activity_feed()` in the same module — it deliberately does **not** use
+`RECENT_THRESHOLD` (its docstring says it returns the most recent N events regardless of
+time), so shrinking the threshold cannot affect it; I confirmed it still returns events
+after the change. Finally I added a regression test (see below) that fails on the 24h
+threshold and passes on the 30-minute one.
+
+### Issue #3 — The same song keeps showing up twice in search
+
+**1. How I reproduced it.**
+As described in the note above, the *user-visible* duplicate does not appear at the ORM
+level because legacy `Query.all()` de-duplicates entity rows. To reproduce the actual
+defect, I ran `search_service`'s exact join and filter but selected a column
+(`Song.id, Song.title`) instead of the `Song` entity, which bypasses the identity
+de-dup. For `q='heights'` (matching only the 3-tag song "Crown Heights Anthem") the
+query returned **3 identical rows**; removing the `outerjoin(song_tags)` returned **1**.
+That is a direct, deterministic reproduction of the row multiplication the bug report
+describes — it is only hidden from users by an implementation detail.
+
+**2. How I found the root cause.**
+`GET /songs/search` in `routes/songs.py` calls `search_songs()` in `search_service.py`.
+Reading the query, I noticed it performs `.outerjoin(song_tags, Song.id ==
+song_tags.c.song_id)` but never references `song_tags` in the `filter` (the filter is
+only on `Song.title`/`Song.artist`), and the returned dicts get their tags from the
+`Song.tags` relationship (`lazy="subquery"` in `models.py`), not from the join. So the
+join contributes nothing to either the filtering or the output — its only effect is to
+emit one row per (song, tag) pair. Cross-referencing that with my column-level
+reproduction (3 rows for a 3-tag song) made me confident the join was both pointless and
+the exact source of the duplication.
+
+**3. The root cause.**
+The search query joins `song_tags` unnecessarily. A `LEFT OUTER JOIN` to a
+many-to-many association table produces one output row per associated tag, so a song
+with N tags yields N rows. The correct result (one row per matching song) requires the
+`FROM` clause not to multiply rows — and since tags are needed neither for filtering nor
+for building the response, the join should not be there at all. The reason no duplicate
+is currently *visible* is that the legacy `db.session.query(Song).all()` interface
+collapses duplicate full-entity rows by primary-key identity. That masking is fragile:
+it silently disappears under SQLAlchemy 2.0-style `select().scalars()`, or the moment
+anyone selects an extra column/entity alongside `Song`. So the code was "correct by
+accident," and the accident is exactly the kind that breaks during a routine upgrade.
+
+**4. My fix.**
+I removed the `.outerjoin(song_tags, ...)` from the query so it selects songs directly
+by the title/artist filter, and dropped the now-unused `Tag`/`song_tags` imports. This
+makes "one row per matching song" true by construction instead of relying on ORM
+de-duplication. Tags still populate correctly because `Song.to_dict()` reads them from
+the `Song.tags` relationship, which is unchanged.
+
+**5. Side-effect check.**
+The risk with removing a join is losing rows or dropping the tag data. I checked both.
+Tag data: after the fix, searching still returns each song's full tag list (e.g., "Crown
+Heights Anthem" still reports `["rap", "hip-hop", "boom bap"]`), because tags come from
+the relationship, not the join. Result completeness: I ran the existing search test
+suite — songs with zero, one, and three tags each still appear **exactly once**
+(`test_search_no_duplicates_*`), and a matching artist-name search still returns its
+song (`test_search_returns_matching_songs`). No song is lost and none is duplicated. The
+full suite remains green.
+
+---
+
+## Regression Tests (stretch)
+
+I added two new test files covering the two fixed bugs that had **no** existing
+coverage, and verified each would have caught its bug: I temporarily re-introduced the
+original buggy code and confirmed the relevant tests fail, then restored the fixes and
+confirmed they pass.
+
+**`tests/test_notifications.py` — covers Issue #4.**
+`test_rating_others_song_notifies_sharer` has one user rate another user's song and
+asserts the sharer receives exactly one `song_rated` notification. Against the buggy
+`rate_song()` — which persisted the rating but never called `create_notification()` —
+this assertion fails with `0 == 1`, because no notification was ever created. The file
+also includes `test_rating_own_song_does_not_notify`, which guards the
+`song.shared_by != user_id` condition so a user is never notified about rating their own
+song.
+
+**`tests/test_feed.py` — covers Issue #2.**
+`test_listening_now_excludes_old_events` sets up a friend who last listened 2 hours ago
+and asserts they do **not** appear in "Friends Listening Now." Against the buggy 24-hour
+`RECENT_THRESHOLD`, that friend is included and the assertion fails. A companion test,
+`test_listening_now_includes_recent_events`, checks the other side of the boundary (a
+friend who listened 5 minutes ago still appears), so the pair pins the behavior on both
+sides of the window.
+
+Verification run against the reintroduced bugs: `2 failed, 2 passed`
+(`test_listening_now_excludes_old_events` and `test_rating_others_song_notifies_sharer`
+failed, exactly as intended); against the fixed code: all 17 tests pass.
